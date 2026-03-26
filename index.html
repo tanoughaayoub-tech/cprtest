@@ -213,16 +213,19 @@ function cprETCO2Sample(t, rr, etco2Quality){
 }
 
 // ── BVM breath on SPO2 strip ────────────────────────
-function bvmSPO2Sample(t, breathRate, pi){
-  const cl=60/Math.max(breathRate,1), tc=(t%cl)/cl;
-  // Sharp BVM breath — quick rise, quick fall, long flat baseline
-  // Shows 2 clear waveforms per cycle visible on strip
+function bvmSPO2Sample(t, comprRate, pi){
+  // During CPR: pleth is driven by chest compressions, NOT breath rate
+  // Each compression produces a small pulsatile waveform — low amplitude
+  // Waveform varies with ventilation (amplitude rises during breath)
+  const cl=60/Math.max(comprRate,1), tc=(t%cl)/cl;
+  // Small compression-driven pulse — narrow, low amplitude
   let v=0;
-  if(tc<0.12)       v=Math.pow(Math.sin(tc/0.12*Math.PI/2),1.2);      // rise
-  else if(tc<0.22)  v=1-(tc-0.12)/0.10*0.15;                           // plateau
-  else if(tc<0.32)  v=0.85*Math.exp(-(tc-0.22)/0.06);                  // sharp fall
-  else              v=0;                                                 // flat baseline
-  return Math.max(0.05,Math.min(0.95,0.08+v*pi*0.82));
+  if(tc<0.15)      v=Math.pow(Math.sin(tc/0.15*Math.PI),1.4)*0.7;  // compression upstroke
+  else if(tc<0.28) v=0.7*(1-(tc-0.15)/0.13);                        // downstroke
+  else if(tc<0.38) v=-0.15*Math.sin((tc-0.28)/0.10*Math.PI);        // dicrotic notch
+  else             v=0;                                               // baseline
+  // pi controls amplitude (poor perfusion = low amplitude)
+  return Math.max(0.05,Math.min(0.95,0.30+v*pi*0.65));
 }
 
 function etco2Sample(t,rr,val){
@@ -617,6 +620,177 @@ function Welcome({onStart}){
 }
 
 // ── Monitor ─────────────────────────────────────────
+// ── CPR Student View ────────────────────────────────
+function CPRStudentView({data, roomCode, onHome}){
+  const [shockTimer,setShockTimer] = useState(0);
+  const [timerRunning,setTimerRunning] = useState(false);
+  const [lastShockCount,setLastShockCount] = useState(0);
+  const [studentJoules,setStudentJoules] = useState(200);
+  const [studentDefibState,setStudentDefibState] = useState('idle');
+  const [studentShockCount,setStudentShockCount] = useState(0);
+
+  // Start timer when shock delivered
+  useEffect(()=>{
+    if(data.shockCount > lastShockCount){
+      setLastShockCount(data.shockCount);
+      setShockTimer(0);
+      setTimerRunning(true);
+    }
+  },[data.shockCount]);
+
+  // Count up timer after shock
+  useEffect(()=>{
+    if(!timerRunning) return;
+    const id=setInterval(()=>setShockTimer(v=>v+1),1000);
+    return()=>clearInterval(id);
+  },[timerRunning]);
+
+  function handleStudentCharge(){
+    if(studentDefibState!=='idle') return;
+    setStudentDefibState('charging');
+    audio.startCharge(studentJoules,()=>setStudentDefibState('ready'));
+  }
+  function handleStudentShock(){
+    if(studentDefibState!=='ready') return;
+    audio.shock();
+    setStudentDefibState('idle');
+    setStudentShockCount(v=>v+1);
+    setShockTimer(0);
+    setTimerRunning(true);
+  }
+
+  // Generators based on remote data
+  const rhythmHR={'Normal':75,'VTach':180,'VFib':300,'Asystole':0,'PEA':50};
+  const ecgGen = useCallback((t)=>
+    data.cprActive ? cprECGSample(t, data.comprRate||100)
+                   : ecgSample(t, data.ecgRhythm, rhythmHR[data.ecgRhythm]||0),
+    [data.cprActive, data.comprRate, data.ecgRhythm]);
+
+  const spo2Gen = useCallback((t)=>{
+    const as=data.airwayStep||0;
+    const cr=data.comprRate||100;
+    if(as===0) return bvmSPO2Sample(t,cr,0.08);  // poor pleth at start
+    if(as===1) return bvmSPO2Sample(t,cr,0.18);  // OPA
+    if(as===2) return bvmSPO2Sample(t,cr,0.28);  // + Suction
+    if(as>=3)  return bvmSPO2Sample(t,cr,0.50);  // BVM — better
+    return 0.08;
+  },[data.airwayStep,data.comprRate]);
+
+  const ventStartRef = useRef(0);
+  useEffect(()=>{
+    ventStartRef.current = Date.now()/1000;
+  },[data.ventCycle]);
+
+  const etco2Gen = useCallback((t)=>{
+    if((data.airwayStep||0)<4) return 0.08+(Math.random()-0.5)*0.008;
+    const elapsed = Date.now()/1000 - ventStartRef.current;
+    if(elapsed>=4.0) return 0.08+(Math.random()-0.5)*0.008; // flat after exactly 2 breaths
+    const maxH=Math.min(0.75,(4+(data.etco2Quality||0)*26)/60);
+    const bp=elapsed%2;
+    if(bp<0.40){const x=bp/0.40;return 0.08+(maxH-0.08)*(1-Math.pow(1-x,1.8));}
+    else if(bp<0.90) return maxH+(bp-0.40)*0.02;
+    else if(bp<1.20){const x=(bp-0.90)/0.30;return(maxH+0.01)-(maxH+0.01-0.08)*Math.pow(x,0.3);}
+    return 0.08;
+  },[data.ventCycle, data.etco2Quality, data.airwayStep]);
+
+  const spo2Display = (data.airwayStep||0)===0?'--':(data.airwayStep||0)<=2?'52':'60';
+  const timerStr = `${String(Math.floor(shockTimer/60)).padStart(2,'0')}:${String(shockTimer%60).padStart(2,'0')}`;
+
+  return(
+    <div className="monitor">
+      {/* Values */}
+      <div className="vals">
+        <div className="vcell">
+          <span className="vlbl ec">ECG</span>
+          <span className="vnum ec" style={{fontSize:'1rem',marginTop:4}}>{data.ecgRhythm==='Normal'?'ROSC':'—'}</span>
+          <span className="vsub">{data.cprActive?'CPR':data.ecgRhythm}</span>
+        </div>
+        <div className="vcell">
+          <span className="vlbl sc">SPO2</span>
+          <span className={`vnum sc ${(data.airwayStep||0)>0?'alarm':''}`}
+            style={{fontSize:(data.airwayStep||0)===0?'1.5rem':'2rem'}}>
+            {spo2Display}
+          </span>
+          <span className="vsub">{(data.airwayStep||0)>0?'%':''}</span>
+        </div>
+        <div className="vcell">
+          <span className="vlbl bc">NIBP</span>
+          <span className="vnum bc" style={{fontSize:'1.3rem'}}>{data.ecgRhythm==='Normal'?'90/60':'—/—'}</span>
+        </div>
+        <div className="vcell">
+          <span className="vlbl xc">ETCO2</span>
+          <span className={`vnum xc ${(data.etco2||4)<10?'alarm':''}`}>{data.etco2||4}</span>
+          <span className="vsub">mmHg</span>
+          <span className="vlbl rc" style={{marginTop:4}}>RR</span>
+          <span className="vnum rc" style={{fontSize:'1.5rem'}}>{data.rr||0}</span>
+          <span className="vlbl rc" style={{marginTop:4,color:'#ff6666'}}>Shocks</span>
+          <span className="vnum rc" style={{fontSize:'1.5rem',color:'#ff6666'}}>{(data.shockCount||0)+studentShockCount}</span>
+        </div>
+      </div>
+
+      {/* Strips */}
+      <div className="strips">
+        <WaveCanvas gen={ecgGen}  color="#00ff7f" label={data.cprActive?'CPR — ECG':'ECG II LEAD'} lineWidth={2.5} key="stu-ecg"/>
+        <WaveCanvas gen={spo2Gen} color="#00bfff" label="Pleth / BVM" lineWidth={2.5} key="stu-spo2"/>
+        <WaveCanvas gen={etco2Gen}color="#ffd700" label="CO2" lineWidth={2.5} key="stu-etco2"/>
+      </div>
+
+      {/* Student CPR panel */}
+      <div className="ctrls">
+        <div className="topbar">
+          <button className="btn-home" onClick={onHome}>🏠 Home</button>
+          <Clock/>
+        </div>
+        <div className="rinfo">
+          <div className="rcode">{roomCode}</div>
+          <div className="rrole">Student — CPR</div>
+        </div>
+
+        {/* 2-min post-shock timer with alarm at 2min */}
+        <div style={{
+          background: shockTimer>=120?'#1a0000':'#1a0a00',
+          border: `2px solid ${shockTimer>=120?'#ff0000':'#ff8800'}`,
+          borderRadius:'8px',padding:'6px',textAlign:'center',marginTop:'4px',
+          animation: shockTimer>=120?'flash 0.5s infinite':'none'
+        }}>
+          <div style={{fontSize:'0.65rem',color:shockTimer>=120?'#ff4444':'#ff8800',letterSpacing:'2px',textTransform:'uppercase'}}>
+            {shockTimer>=120?'⚡ SHOCK DUE NOW':'Post-Shock Timer'}
+          </div>
+          <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:'1.8rem',color:shockTimer>=120?'#ff4444':'#ffaa00'}}>
+            {timerStr}
+          </div>
+          {shockTimer>0&&<div style={{fontSize:'0.6rem',color:'#6a5a3a',letterSpacing:'1px'}}>
+            {shockTimer<120?`Next shock in ${120-shockTimer}s`:'Reassess rhythm'}
+          </div>}
+        </div>
+
+        {/* Defib */}
+        <div className="defib-panel" style={{marginTop:'6px'}}>
+          <div className="defib-title">⚡ Defibrillator</div>
+          <div className="defib-joules">
+            {[200,300,360].map(j=>(
+              <button key={j} className={`defib-j-btn ${studentJoules===j?'sel':''}`}
+                onClick={()=>{if(studentDefibState==='idle')setStudentJoules(j);}}>
+                {j}J
+              </button>
+            ))}
+          </div>
+          <button className={`shock-btn ${studentDefibState}`}
+            onClick={studentDefibState==='idle'?handleStudentCharge:studentDefibState==='ready'?handleStudentShock:undefined}>
+            {studentDefibState==='idle'?`⚡ Charge ${studentJoules}J`:studentDefibState==='charging'?'Charging...':'SHOCK — STAND CLEAR'}
+          </button>
+        </div>
+
+        {/* Instructor rhythm info */}
+        <div style={{marginTop:'8px',textAlign:'center',color:'#4a6a4a',fontSize:'0.7rem',letterSpacing:'1px'}}>
+          Instructor controls vitals &amp; rhythm
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function Monitor({session,onHome}){
   const {mode,roomCode}=session;
   const isInst=mode!=='student';
@@ -652,6 +826,8 @@ function Monitor({session,onHome}){
   const [studentShockCount,setStudentShockCount]=useState(0);
   // Alarms
   const [alarms,setAlarms]=useState({});
+  const [isCPRMode,setIsCPRMode]=useState(session.mode==='cpr');
+  const [remoteData,setRemoteData]=useState(null);
 
   const noiseR=useRef({hr:Math.random()*100,spo2:Math.random()*100,sbp:Math.random()*100,dbp:Math.random()*100,etco2:Math.random()*100,rr:Math.random()*100});
   const sRef=useRef({});
@@ -714,8 +890,15 @@ function Monitor({session,onHome}){
     }else{
       const id=setInterval(async()=>{
         const d=await fr(roomCode);if(!d)return;
+        if(d.mode==='cpr'){
+          // CPR room — switch to CPR student view
+          setRemoteData(d);
+          setIsCPRMode(true);
+          return;
+        }
+        setIsCPRMode(false);
         setEcgR(d.ecgRhythm);setHr(d.hr);setSpo2Val(d.spo2);setPerf(d.perfusion);
-        setSys(d.systolic);setDia(d.diastolic);setEtco2(d.etco2);setRr(d.rr);
+        setSys(d.systolic);setDia(d.diastolic);setBpSt(d.bpState||'Normal');setEtco2(d.etco2);setRr(d.rr);
       },1000);
       return()=>clearInterval(id);
     }
@@ -764,6 +947,11 @@ function Monitor({session,onHome}){
 
   // SPO2 preset helper
   function setSPO2Preset(val,pi){setSpo2Val(val);setPerf(pi);}
+
+  // Safe to do conditional render AFTER all hooks
+  if(!isInst && isCPRMode && remoteData){
+    return <CPRStudentView data={remoteData} roomCode={roomCode} onHome={onHome}/>;
+  }
 
   return(
     <div className="monitor">
@@ -906,15 +1094,17 @@ function CPRMonitor({session, onHome}){
 
   // Defib state
   const [joules,setJoules]          = useState(200);
-  const [defibState,setDefibState]  = useState('idle'); // idle|charging|ready
+  const [defibState,setDefibState]  = useState('idle');
+  const [instrTimer,setInstrTimer]  = useState(0); // idle|charging|ready
   const [shockCount,setShockCount]  = useState(0);
+  const instrTimerRef = useRef(null);
 
   // Display values
   const [dispETCO2,setDispETCO2]    = useState(5);
   const [dispHR,setDispHR]          = useState(0);
 
-  const sRef = useRef({cprActive,comprRate,etco2Quality,airwayStep,rhythm});
-  useEffect(()=>{sRef.current={cprActive,comprRate,etco2Quality,airwayStep,rhythm};},[cprActive,comprRate,etco2Quality,airwayStep,rhythm]);
+  const sRef = useRef({cprActive,comprRate,etco2Quality,airwayStep,rhythm,shockCount,ventCycle});
+  useEffect(()=>{sRef.current={cprActive,comprRate,etco2Quality,airwayStep,rhythm,shockCount,ventCycle};},[cprActive,comprRate,etco2Quality,airwayStep,rhythm,shockCount,ventCycle]);
 
   // Update display ETCO2 based on quality
   useEffect(()=>{
@@ -928,11 +1118,31 @@ function CPRMonitor({session, onHome}){
     if(!roomCode) return;
     const id=setInterval(()=>{
       const s=sRef.current;
+      const rhythmHR={'Normal':75,'VTach':180,'VFib':300,'Asystole':0,'PEA':50};
+      // SPO2 based on airway step
+      const spo2Val = s.airwayStep===0?0:s.airwayStep<=2?52:s.airwayStep===3?60:88;
+      const perfVal = s.airwayStep===0?0.05:s.airwayStep<=2?0.12:s.airwayStep===3?0.20:0.55;
+      // ETCO2 based on airway + quality
+      const etco2Val = s.airwayStep>=4 ? Math.round(4+s.etco2Quality*26) : 4;
+      const rrVal    = s.airwayStep>=4 ? 8 : 0;
       fw(roomCode,{
-        ecgRhythm:s.rhythm,hr:s.rhythm==='Normal'?75:0,
-        spo2:s.airwayStep>=3?92:70,perfusion:s.airwayStep>=3?0.5:0.1,
-        systolic:s.rhythm==='Normal'?90:0,diastolic:s.rhythm==='Normal'?60:0,
-        bpState:'Normal',etco2:5+s.etco2Quality*30,rr:s.airwayStep>=3?10:0
+        mode:'cpr',
+        ecgRhythm:s.rhythm,
+        hr:rhythmHR[s.rhythm]||0,
+        cprActive:s.cprActive,
+        comprRate:s.comprRate,
+        spo2:spo2Val,
+        perfusion:perfVal,
+        comprRate:s.comprRate,
+        systolic:s.rhythm==='Normal'?90:0,
+        diastolic:s.rhythm==='Normal'?60:0,
+        bpState:'Normal',
+        etco2:etco2Val,
+        rr:rrVal,
+        airwayStep:s.airwayStep,
+        etco2Quality:s.etco2Quality,
+        shockCount:s.shockCount,
+        ventCycle:s.ventCycle
       });
     },500);
     return()=>clearInterval(id);
@@ -944,13 +1154,14 @@ function CPRMonitor({session, onHome}){
     cprActive ? cprECGSample(t,comprRate) : ecgSample(t,rhythm, rhythmHR[rhythm]||0),
     [cprActive,comprRate,rhythm]);
 
-  // SPO2: flat near zero until BVM connected
+  // SPO2: compression-driven pleth — improves with each airway step
   const spo2Gen = useCallback((t)=>{
-    if(airwayStep===0) return 0.08 + (Math.random()-0.5)*0.01; // flat line — no reading
-    if(airwayStep<=2)  return spo2Sample(t,75,0.12);           // very poor perfusion 52%
-    if(airwayStep===3) return spo2Sample(t,75,0.20);           // BVM connected 60%
-    return bvmSPO2Sample(t,8,0.55);                            // ventilating 88%
-  },[airwayStep]);
+    if(airwayStep===0) return bvmSPO2Sample(t,comprRate,0.08);  // poor pleth — compressions only, very low amp
+    if(airwayStep===1) return bvmSPO2Sample(t,comprRate,0.18);  // OPA — slightly better
+    if(airwayStep===2) return bvmSPO2Sample(t,comprRate,0.28);  // + Suction — improving
+    if(airwayStep>=3)  return bvmSPO2Sample(t,comprRate,0.50);  // BVM + ventilating — noticeably better
+    return 0.08;
+  },[airwayStep,comprRate]);
 
   // Track when each ventilation cycle started
   const ventStartRef = useRef(0);
@@ -968,17 +1179,17 @@ function CPRMonitor({session, onHome}){
     // Time since last vent button click
     const elapsed = Date.now()/1000 - ventStartRef.current;
     // Show 2 breaths (4s window) then go flat
-    if(elapsed > 4.5) return 0.08 + (Math.random()-0.5)*0.008; // flat after 2 breaths done
-    // 2 breath waveforms in 4s window
+    if(elapsed >= 4.0) return 0.08 + (Math.random()-0.5)*0.008; // strictly flat after exactly 2 breaths
+    // 2 breath waveforms — each breath 2s, strictly cut at 4.0s
     const maxH = Math.min(0.75,(4+eq*26)/60);
-    const breathPos = elapsed % 2; // each breath = 2s
+    const breathPos = elapsed % 2; // position within each 2s breath
     if(breathPos<0.40){
       const x=breathPos/0.40;
       return 0.08+(maxH-0.08)*(1-Math.pow(1-x,1.8));
     } else if(breathPos<0.90){
       return maxH+(breathPos-0.40)*0.02;
-    } else if(breathPos<1.15){
-      const x=(breathPos-0.90)/0.25;
+    } else if(breathPos<1.20){
+      const x=(breathPos-0.90)/0.30;
       return (maxH+0.01)-(maxH+0.01-0.08)*Math.pow(x,0.3);
     }
     return 0.08;
@@ -1008,8 +1219,8 @@ function CPRMonitor({session, onHome}){
       {/* Values — dynamic based on airway steps */}
       {(()=>{
         // SPO2 value based on airway progress
-        const spo2Display = airwayStep===0?'--':airwayStep<=2?'52':airwayStep===3?'60':airwayStep>=4?'88':'--';
-        const spo2Alarm   = airwayStep<4;
+        const spo2Display = airwayStep===0?'--':airwayStep<=2?'52':airwayStep===3?'60':airwayStep>=4?'60':'--';
+
         // ETCO2 value based on airway + quality
         const etco2Display = airwayStep>=4 ? Math.round(4+etco2Quality*26) : 4;
         const rrDisplay    = airwayStep>=4 ? 8 : 0;
@@ -1022,7 +1233,7 @@ function CPRMonitor({session, onHome}){
             </div>
             <div className="vcell">
               <span className="vlbl sc">SPO2</span>
-              <span className={`vnum sc ${spo2Alarm&&airwayStep>0?'alarm':''}`}
+              <span className={`vnum sc ${airwayStep>0?'alarm':''}`}
                 style={{fontSize:airwayStep===0?'1.5rem':'2rem'}}>
                 {spo2Display}
               </span>
@@ -1063,6 +1274,22 @@ function CPRMonitor({session, onHome}){
           <div className="rinfo">
             <div className="rcode">{roomCode}</div>
             <div className="rrole">CPR Instructor</div>
+          </div>
+        )}
+        {/* 2-min shock timer for instructor */}
+        {shockCount>0&&(
+          <div style={{
+            background:instrTimer>=120?'#1a0000':'#0a1a0a',
+            border:`2px solid ${instrTimer>=120?'#ff0000':'#1a4a1a'}`,
+            borderRadius:'8px',padding:'5px',textAlign:'center',
+            animation:instrTimer>=120?'flash 0.5s infinite':'none'
+          }}>
+            <div style={{fontSize:'0.62rem',color:instrTimer>=120?'#ff4444':'#4a8a4a',letterSpacing:'2px',textTransform:'uppercase'}}>
+              {instrTimer>=120?'⚡ SHOCK DUE':'Post-Shock'}
+            </div>
+            <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:'1.5rem',color:instrTimer>=120?'#ff4444':'#00ff7f'}}>
+              {String(Math.floor(instrTimer/60)).padStart(2,'0')}:{String(instrTimer%60).padStart(2,'0')}
+            </div>
           </div>
         )}
 
@@ -1189,6 +1416,7 @@ function App(){
   const [session,setSession]=useState(null);
   if(!session) return <Welcome onStart={setSession}/>;
   if(session.mode==='cpr') return <CPRMonitor session={session} onHome={()=>setSession(null)}/>;
+  if(session.mode==='student-cpr') return <CPRStudentView data={session.data} roomCode={session.roomCode} onHome={()=>setSession(null)}/>;
   return <Monitor session={session} onHome={()=>setSession(null)}/>;
 }
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
